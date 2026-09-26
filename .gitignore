@@ -1,0 +1,9 @@
+student_resource/
+# Local Python environment
+.venv/
+
+# Python-generated files and caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
