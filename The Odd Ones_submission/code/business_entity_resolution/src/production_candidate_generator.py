@@ -8,7 +8,7 @@ from data_loader import load_test_data
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
 BASE_DIR = os.path.abspath(
@@ -26,16 +26,20 @@ OUTPUT_FILE = os.path.join(
     "candidate_pairs.tsv"
 )
 
-# Ignore tokens occurring more than this many times.
-# Extremely common tokens create huge candidate sets.
-MAX_TOKEN_FREQUENCY = 5000
+# ------------------------------------------------------------
+# Blocking controls
+# ------------------------------------------------------------
 
-# Keep only the rarest N useful tokens from each field.
-RAREST_NAME_TOKENS = 3
-RAREST_ADDRESS_TOKENS = 4
+# Ignore extremely common tokens.
+# Common tokens generate enormous candidate sets.
+MAX_TOKEN_FREQUENCY = 1000
 
-# Maximum candidates retained per S1.
-MAX_CANDIDATES_PER_S1 = 5000
+# Number of rarest useful tokens used from each field.
+RAREST_NAME_TOKENS = 2
+RAREST_ADDRESS_TOKENS = 2
+
+# Hard safety limit.
+MAX_CANDIDATES_PER_S1 = 500
 
 # Progress reporting.
 PRINT_EVERY = 10000
@@ -72,11 +76,11 @@ def get_tokens(value):
     if not value:
         return set()
 
-    return set(
+    return {
         token
         for token in value.split()
         if token
-    )
+    }
 
 
 # ============================================================
@@ -89,30 +93,28 @@ def build_token_index(target, column):
         f"Building {column} token index..."
     )
 
-    index = defaultdict(list)
-
     frequencies = Counter()
 
     # --------------------------------------------------------
-    # First pass: frequency
+    # Pass 1: token frequencies
     # --------------------------------------------------------
 
     for value in target[column]:
 
-        tokens = get_tokens(value)
-
-        for token in tokens:
+        for token in get_tokens(value):
 
             frequencies[token] += 1
 
     print(
         f"Unique {column} tokens:",
-        len(frequencies)
+        f"{len(frequencies):,}"
     )
 
     # --------------------------------------------------------
-    # Second pass: index
+    # Pass 2: token -> entity IDs
     # --------------------------------------------------------
+
+    index = defaultdict(list)
 
     for row in target.itertuples(index=False):
 
@@ -121,9 +123,7 @@ def build_token_index(target, column):
             column
         )
 
-        tokens = get_tokens(value)
-
-        for token in tokens:
+        for token in get_tokens(value):
 
             if (
                 frequencies[token]
@@ -136,171 +136,136 @@ def build_token_index(target, column):
 
     print(
         f"{column} index keys:",
-        len(index)
+        f"{len(index):,}"
     )
 
     return index, frequencies
 
 
 # ============================================================
-# CANDIDATE RANKING
+# CANDIDATE SCORING
 # ============================================================
 
-def rank_candidates(
+def score_candidate(
     s1_row,
-    candidates,
-    target_lookup,
+    target_row,
     name_freq,
     address_freq
 ):
 
-    s1_name_tokens = get_tokens(
+    name1 = get_tokens(
         s1_row.name_norm
     )
 
-    s1_address_tokens = get_tokens(
+    name2 = get_tokens(
+        target_row["name_norm"]
+    )
+
+    address1 = get_tokens(
         s1_row.address_norm
     )
 
-    scored = []
-
-    for target_id in candidates:
-
-        target_row = target_lookup.get(
-            target_id
-        )
-
-        if target_row is None:
-            continue
-
-        # Country should always agree.
-        if (
-            s1_row.country
-            != target_row["country"]
-        ):
-            continue
-
-        target_name_tokens = get_tokens(
-            target_row["name_norm"]
-        )
-
-        target_address_tokens = get_tokens(
-            target_row["address_norm"]
-        )
-
-        shared_name = (
-            s1_name_tokens
-            &
-            target_name_tokens
-        )
-
-        shared_address = (
-            s1_address_tokens
-            &
-            target_address_tokens
-        )
-
-        # ----------------------------------------------------
-        # Exact matches
-        # ----------------------------------------------------
-
-        exact_name = int(
-            bool(s1_row.name_norm)
-            and
-            s1_row.name_norm
-            ==
-            target_row["name_norm"]
-        )
-
-        exact_address = int(
-            bool(s1_row.address_norm)
-            and
-            s1_row.address_norm
-            ==
-            target_row["address_norm"]
-        )
-
-        # ----------------------------------------------------
-        # Rarity score
-        # ----------------------------------------------------
-
-        name_rarity = 0.0
-
-        for token in shared_name:
-
-            freq = name_freq.get(
-                token,
-                MAX_TOKEN_FREQUENCY + 1
-            )
-
-            if freq > 0:
-
-                name_rarity += (
-                    1.0 / freq
-                )
-
-        address_rarity = 0.0
-
-        for token in shared_address:
-
-            freq = address_freq.get(
-                token,
-                MAX_TOKEN_FREQUENCY + 1
-            )
-
-            if freq > 0:
-
-                address_rarity += (
-                    1.0 / freq
-                )
-
-        # ----------------------------------------------------
-        # Retrieval score
-        # ----------------------------------------------------
-
-        score = (
-
-            exact_name * 100000
-
-            +
-
-            exact_address * 100000
-
-            +
-
-            len(shared_name) * 100
-
-            +
-
-            len(shared_address) * 150
-
-            +
-
-            name_rarity * 10000
-
-            +
-
-            address_rarity * 10000
-        )
-
-        scored.append(
-            (
-                score,
-                target_id
-            )
-        )
-
-    scored.sort(
-        reverse=True
+    address2 = get_tokens(
+        target_row["address_norm"]
     )
 
-    return [
-        target_id
-        for _, target_id
-        in scored[
-            :MAX_CANDIDATES_PER_S1
-        ]
-    ]
+    shared_name = name1 & name2
+    shared_address = address1 & address2
+
+    # --------------------------------------------------------
+    # Exact matches
+    # --------------------------------------------------------
+
+    exact_name = (
+        bool(s1_row.name_norm)
+        and
+        s1_row.name_norm
+        ==
+        target_row["name_norm"]
+    )
+
+    exact_address = (
+        bool(s1_row.address_norm)
+        and
+        s1_row.address_norm
+        ==
+        target_row["address_norm"]
+    )
+
+    # --------------------------------------------------------
+    # Rarity score
+    # --------------------------------------------------------
+
+    name_rarity = 0.0
+
+    for token in shared_name:
+
+        frequency = name_freq.get(
+            token,
+            MAX_TOKEN_FREQUENCY + 1
+        )
+
+        if frequency > 0:
+
+            name_rarity += (
+                1.0 / frequency
+            )
+
+    address_rarity = 0.0
+
+    for token in shared_address:
+
+        frequency = address_freq.get(
+            token,
+            MAX_TOKEN_FREQUENCY + 1
+        )
+
+        if frequency > 0:
+
+            address_rarity += (
+                1.0 / frequency
+            )
+
+    # --------------------------------------------------------
+    # Candidate score
+    # --------------------------------------------------------
+    #
+    # Exact matches dominate.
+    # Address overlap gets slightly more weight because
+    # addresses are generally more discriminative.
+    #
+    # Rarity prevents common tokens from dominating.
+    # --------------------------------------------------------
+
+    score = 0.0
+
+    if exact_name:
+        score += 100000
+
+    if exact_address:
+        score += 100000
+
+    score += (
+        len(shared_name)
+        * 100
+    )
+
+    score += (
+        len(shared_address)
+        * 150
+    )
+
+    score += (
+        name_rarity
+        * 10000
+    )
+
+    score += (
+        address_rarity
+        * 10000
+    )
+
+    return score
 
 
 # ============================================================
@@ -338,7 +303,7 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Combine targets
+    # Combine target sources
     # --------------------------------------------------------
 
     target = pd.concat(
@@ -384,7 +349,9 @@ def main():
 
     for row in target.itertuples(index=False):
 
-        target_lookup[row.entity_id] = {
+        target_lookup[
+            row.entity_id
+        ] = {
             "name_norm":
                 row.name_norm,
 
@@ -396,7 +363,7 @@ def main():
         }
 
     # --------------------------------------------------------
-    # Token indexes
+    # Build indexes
     # --------------------------------------------------------
 
     print()
@@ -418,16 +385,24 @@ def main():
     )
 
     # --------------------------------------------------------
-    # Generate candidates
+    # Candidate generation
     # --------------------------------------------------------
 
     print()
     print("Generating candidates...")
+    print(
+        f"Maximum candidates/S1: "
+        f"{MAX_CANDIDATES_PER_S1}"
+    )
 
     output_rows = []
 
     total_candidates = 0
     max_candidates = 0
+
+    # --------------------------------------------------------
+    # Process S1
+    # --------------------------------------------------------
 
     for i, row in enumerate(
         s1.itertuples(index=False),
@@ -436,40 +411,38 @@ def main():
 
         candidates = set()
 
+        # ----------------------------------------------------
+        # Name tokens
+        # ----------------------------------------------------
+
         name_tokens = get_tokens(
             row.name_norm
         )
-
-        address_tokens = get_tokens(
-            row.address_norm
-        )
-
-        # ----------------------------------------------------
-        # Name candidates
-        # ----------------------------------------------------
 
         useful_name_tokens = []
 
         for token in name_tokens:
 
-            freq = name_freq.get(
+            frequency = name_freq.get(
                 token,
                 MAX_TOKEN_FREQUENCY + 1
             )
 
             if (
-                freq
+                frequency
                 <= MAX_TOKEN_FREQUENCY
             ):
 
                 useful_name_tokens.append(
                     (
-                        freq,
+                        frequency,
                         token
                     )
                 )
 
-        useful_name_tokens.sort()
+        useful_name_tokens.sort(
+            key=lambda x: x[0]
+        )
 
         useful_name_tokens = (
             useful_name_tokens[
@@ -487,31 +460,37 @@ def main():
             )
 
         # ----------------------------------------------------
-        # Address candidates
+        # Address tokens
         # ----------------------------------------------------
+
+        address_tokens = get_tokens(
+            row.address_norm
+        )
 
         useful_address_tokens = []
 
         for token in address_tokens:
 
-            freq = address_freq.get(
+            frequency = address_freq.get(
                 token,
                 MAX_TOKEN_FREQUENCY + 1
             )
 
             if (
-                freq
+                frequency
                 <= MAX_TOKEN_FREQUENCY
             ):
 
                 useful_address_tokens.append(
                     (
-                        freq,
+                        frequency,
                         token
                     )
                 )
 
-        useful_address_tokens.sort()
+        useful_address_tokens.sort(
+            key=lambda x: x[0]
+        )
 
         useful_address_tokens = (
             useful_address_tokens[
@@ -529,22 +508,61 @@ def main():
             )
 
         # ----------------------------------------------------
-        # Rank
+        # Score candidates
         # ----------------------------------------------------
 
-        ranked = rank_candidates(
-            row,
-            candidates,
-            target_lookup,
-            name_freq,
-            address_freq
+        scored_candidates = []
+
+        for target_id in candidates:
+
+            target_row = target_lookup.get(
+                target_id
+            )
+
+            if target_row is None:
+                continue
+
+            # Country blocking.
+            if (
+                row.country
+                != target_row["country"]
+            ):
+                continue
+
+            score = score_candidate(
+                row,
+                target_row,
+                name_freq,
+                address_freq
+            )
+
+            scored_candidates.append(
+                (
+                    score,
+                    target_id
+                )
+            )
+
+        # ----------------------------------------------------
+        # Keep top candidates
+        # ----------------------------------------------------
+
+        scored_candidates.sort(
+            key=lambda x: x[0],
+            reverse=True
+        )
+
+        ranked_candidates = (
+            scored_candidates[
+                :MAX_CANDIDATES_PER_S1
+            ]
         )
 
         # ----------------------------------------------------
-        # Save
+        # Save candidate pairs
         # ----------------------------------------------------
 
-        for target_id in ranked:
+        for _, target_id in ranked_candidates:
 
             output_rows.append(
                 (
@@ -554,22 +572,29 @@ def main():
             )
 
         candidate_count = len(
-            ranked
+            ranked_candidates
         )
 
         total_candidates += (
             candidate_count
         )
 
-        max_candidates = max(
-            max_candidates,
-            candidate_count
-        )
+        if candidate_count > max_candidates:
+
+            max_candidates = (
+                candidate_count
+            )
+
+        # ----------------------------------------------------
+        # Progress
+        # ----------------------------------------------------
 
         if i % PRINT_EVERY == 0:
 
-            mean = (
-                total_candidates / i
+            mean_candidates = (
+                total_candidates
+                /
+                i
             )
 
             print(
@@ -577,7 +602,7 @@ def main():
                 f"{i:,}/"
                 f"{len(s1):,} | "
                 f"Mean candidates/S1: "
-                f"{mean:,.1f} | "
+                f"{mean_candidates:,.1f} | "
                 f"Current: "
                 f"{candidate_count:,} | "
                 f"Max: "
@@ -585,11 +610,11 @@ def main():
             )
 
     # --------------------------------------------------------
-    # Save
+    # Create output
     # --------------------------------------------------------
 
     print()
-    print("Saving candidate_pairs.tsv...")
+    print("Creating output dataframe...")
 
     result = pd.DataFrame(
         output_rows,
@@ -599,9 +624,18 @@ def main():
         ]
     )
 
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
     os.makedirs(
         os.path.dirname(OUTPUT_FILE),
         exist_ok=True
+    )
+
+    print(
+        "Writing:",
+        OUTPUT_FILE
     )
 
     result.to_csv(
