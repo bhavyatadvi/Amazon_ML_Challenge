@@ -10,3 +10,5 @@ __pycache__/
 
 __MACOSX/*
 extra.txt
+
+output/other/stage1_reduced_candidates.tsv
